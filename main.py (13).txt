@@ -1,0 +1,766 @@
+import discord
+from discord.ext import commands
+import os
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is online!")
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, format, *args):
+        return
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    print(f"Starting web server on 0.0.0.0:{port} ...", flush=True)
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+        print(f"Web server listening on port {port}", flush=True)
+        server.serve_forever()
+    except Exception as e:
+        print(f"Web server failed: {e}", flush=True)
+
+threading.Thread(target=run_web_server, daemon=True).start()
+
+TOKEN = os.getenv("TOKEN")
+PREFIX = "!"
+PRICE_FILE = "price.json"
+DEFAULT_PRICE = 0.70
+STOCK_FILE = "stock.json"
+BANNER_FILE = "banner.json"
+pending_orders = {}
+active_tickets = {}
+
+def has_open_ticket(guild, user):
+    ch_id = active_tickets.get(user.id)
+    if ch_id:
+        ch = guild.get_channel(ch_id)
+        if ch:
+            return ch
+        active_tickets.pop(user.id, None)
+    for ch in guild.text_channels:
+        if ch.name.startswith('ticket-'):
+            if user in ch.members:
+                return ch
+    return None
+
+def load_price():
+    try:
+        with open(PRICE_FILE, "r") as f:
+            return float(json.load(f).get("price_per_robux", DEFAULT_PRICE))
+    except:
+        return DEFAULT_PRICE
+
+def save_price(price):
+    with open(PRICE_FILE, "w") as f:
+        json.dump({"price_per_robux": price}, f, indent=4)
+
+def get_price():
+    return load_price()
+
+def load_stock():
+    try:
+        with open(STOCK_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {"robux": 0}
+
+def save_stock(stock):
+    with open(STOCK_FILE, "w") as f:
+        json.dump(stock, f, indent=4)
+
+def load_banner():
+    try:
+        with open(BANNER_FILE, "r") as f:
+            return json.load(f).get("url", None)
+    except:
+        return None
+
+def save_banner(url):
+    with open(BANNER_FILE, "w") as f:
+        json.dump({"url": url}, f, indent=4)
+
+AUTOROLE_FILE = "autorole.json"
+
+def load_autorole():
+    try:
+        import json as _j
+        with open(AUTOROLE_FILE, "r") as f:
+            return _j.load(f).get("role_id", None)
+    except:
+        return None
+
+def save_autorole(role_id):
+    import json as _j
+    with open(AUTOROLE_FILE, "w") as f:
+        _j.dump({"role_id": role_id}, f, indent=4)
+
+ROLEMENU_FILE = "rolemenu.json"
+
+def load_rolemenu():
+    try:
+        import json as _j
+        with open(ROLEMENU_FILE, "r") as f:
+            return _j.load(f).get("roles", [])
+    except:
+        return []
+
+def save_rolemenu(roles):
+    import json as _j
+    with open(ROLEMENU_FILE, "w") as f:
+        _j.dump({"roles": roles}, f, indent=4)
+
+GCASH_FILE = "gcash.json"
+
+def load_gcash():
+    try:
+        with open(GCASH_FILE, "r") as f:
+            data = json.load(f)
+            return {"number": data.get("number", None), "name": data.get("name", ""), "qr": data.get("qr", None)}
+    except:
+        return {"number": None, "name": "", "qr": None}
+
+def save_gcash(number=None, name="", qr=None):
+    cur = load_gcash()
+    if number is not None:
+        cur["number"] = number
+    if name:
+        cur["name"] = name
+    if qr is not None:
+        cur["qr"] = qr
+    with open(GCASH_FILE, "w") as f:
+        json.dump(cur, f, indent=4)
+    return cur
+
+def make_payment_embed(pesos, need):
+    gcash = load_gcash()
+    embed = discord.Embed(title="💸 PAYMENT - GCash", description=f"Please pay **₱{pesos}** for **{need} Robux**", color=0x007DFF)
+    if gcash["number"]:
+        name_text = f" ({gcash['name']})" if gcash["name"] else ""
+        embed.add_field(name="GCash Number", value=f"**{gcash['number']}**{name_text}", inline=False)
+    else:
+        embed.add_field(name="GCash Number", value="Not set yet. Please contact seller.", inline=False)
+    embed.add_field(name="Next", value="1. Pay via GCash\n2. Send screenshot + IGN here\n3. Wait for seller to confirm", inline=False)
+    if gcash["qr"]:
+        embed.set_image(url=gcash["qr"])
+    embed.set_footer(text="Send screenshot after paying")
+    return embed
+
+def robux_for_pesos(pesos):
+    price = get_price()
+    if price <= 0:
+        price = DEFAULT_PRICE
+    return int(pesos / price)
+
+def pricelist_text():
+    amounts = [50, 100, 150, 200, 300, 500, 1000]
+    return "\n".join([f"₱{p} = {robux_for_pesos(p)} Robux" for p in amounts])
+
+def make_catalogue_embed(stock):
+    embed = discord.Embed(title="🛒 ROBUX PRICE CATALOGUE", description="PH's Discounted Robux Store\nLive prices, synced with our ordering system.", color=0xA855F7)
+    banner = load_banner()
+    if banner:
+        embed.set_image(url=banner)  # Kasama sa same box, sa baba ng text
+    embed.add_field(name="💜 Robux Transfer:", value="🟢 Available", inline=False)
+    embed.add_field(name="📦 Stock:", value=f"**{stock['robux']} Robux available**", inline=False)
+    embed.add_field(name="💡 How to buy:", value="Press a button below. Pindot ka lang!", inline=False)
+    embed.add_field(name="Payment:", value="GCash", inline=False)
+    embed.set_footer(text=f"Robux Shop • ₱{get_price():.2f} per Robux • Fast & Legit")
+    return embed
+
+async def create_pending_ticket(guild, user, pesos, need):
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+    }
+    for role in guild.roles:
+        if role.permissions.administrator:
+            overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+    channel = await guild.create_text_channel(f"ticket-{user.name}-{pesos}", overwrites=overwrites)
+    active_tickets[user.id] = channel.id
+    pending_orders[channel.id] = {"buyer_id": user.id, "buyer_name": str(user), "pesos": pesos, "need": need}
+    return channel
+
+class RoleMenuView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        roles = load_rolemenu()
+        for r in roles:
+            # label = role name or custom label
+            label = r.get("label") or r.get("name") or "Role"
+            emoji = r.get("emoji") or "🎭"
+            btn = discord.ui.Button(label=f"{emoji} {label}", style=discord.ButtonStyle.secondary, custom_id=f"rolemenu_{r['id']}")
+            btn.callback = self.make_toggle_callback(r['id'], label)
+            self.add_item(btn)
+    def make_toggle_callback(self, role_id, label):
+        async def callback(interaction: discord.Interaction):
+            role = interaction.guild.get_role(role_id)
+            if not role:
+                await interaction.response.send_message("❌ Role not found, baka na-delete na. Contact admin.", ephemeral=True)
+                return
+            member = interaction.user
+            if role in member.roles:
+                try:
+                    await member.remove_roles(role)
+                    await interaction.response.send_message(f"❌ Removed role: **{role.name}**", ephemeral=True)
+                except Exception as e:
+                    await interaction.response.send_message(f"❌ Hindi ko maalis role mo. Baka mas mataas role mo kesa sa bot. Error: {e}", ephemeral=True)
+            else:
+                try:
+                    await member.add_roles(role)
+                    await interaction.response.send_message(f"✅ You got role: **{role.name}**", ephemeral=True)
+                except Exception as e:
+                    await interaction.response.send_message(f"❌ Hindi ko mabigay role. Baka mas mataas yung role kesa sa bot ko. Error: {e}", ephemeral=True)
+        return callback
+
+class CloseTicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.secondary)
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("🔒 Closing ticket in 3 seconds...")
+        _ord = pending_orders.pop(interaction.channel.id, None)
+        _uid = _ord.get('buyer_id') if _ord else None
+        if _uid:
+            active_tickets.pop(_uid, None)
+        import asyncio
+        await asyncio.sleep(3)
+        try:
+            await interaction.channel.delete()
+        except:
+            pass
+
+class ConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    @discord.ui.button(label="✅ Confirm - Paid na", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Seller/admin lang pwede mag-confirm.", ephemeral=True)
+            return
+        order = pending_orders.get(interaction.channel.id)
+        if not order:
+            await interaction.response.send_message("❌ Wala nang pending order dito.", ephemeral=True)
+            return
+        stock = load_stock()
+        if stock["robux"] < order["need"]:
+            await interaction.response.send_message(f"❌ Kulang stock! Need {order['need']} pero {stock['robux']} lang.", ephemeral=True)
+            return
+        stock["robux"] -= order["need"]
+        save_stock(stock)
+        del pending_orders[interaction.channel.id]
+        embed = discord.Embed(title="✅ TRANSACTION CONFIRMED", color=0x22C55E)
+        embed.add_field(name="Buyer", value=f"<@{order['buyer_id']}>", inline=False)
+        embed.add_field(name="Amount", value=f"₱{order['pesos']}", inline=True)
+        embed.add_field(name="Robux Sent", value=f"{order['need']} Robux", inline=True)
+        embed.add_field(name="Remaining Stock", value=f"{stock['robux']} Robux", inline=False)
+        await interaction.response.send_message(embed=embed)
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Seller/admin lang pwede mag-cancel.", ephemeral=True)
+            return
+        order = _ord = pending_orders.pop(interaction.channel.id, None)
+        _uid = _ord.get('buyer_id') if _ord else None
+        if _uid:
+            active_tickets.pop(_uid, None)
+        if not order:
+            await interaction.response.send_message("Wala nang pending order.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"❌ Order cancelled. Closing ticket in 3 seconds...")
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except:
+            pass
+        import asyncio
+        await asyncio.sleep(3)
+        try:
+            await interaction.channel.delete()
+        except:
+            pass
+    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.secondary)
+    async def close_ticket_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Kahit buyer or admin pwede mag-close
+        await interaction.response.send_message("🔒 Closing ticket in 3 seconds...")
+        _ord = pending_orders.pop(interaction.channel.id, None)
+        _uid = _ord.get('buyer_id') if _ord else None
+        if _uid:
+            active_tickets.pop(_uid, None)
+        import asyncio
+        await asyncio.sleep(3)
+        try:
+            await interaction.channel.delete()
+        except:
+            pass
+
+class AdminSettingsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+    @discord.ui.button(label="➕ Add Stock", style=discord.ButtonStyle.success)
+    async def add_stock_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admin lang pwede.", ephemeral=True)
+            return
+        await interaction.response.send_message("Type mo: `!addstock <amount>`\nExample: `!addstock 1000`", ephemeral=True)
+    @discord.ui.button(label="➖ Remove Stock", style=discord.ButtonStyle.danger)
+    async def remove_stock_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admin lang pwede.", ephemeral=True)
+            return
+        await interaction.response.send_message("Type mo: `!removestock <amount>`\nExample: `!removestock 500`", ephemeral=True)
+    @discord.ui.button(label="✏️ Set Stock", style=discord.ButtonStyle.primary)
+    async def set_stock_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admin lang pwede.", ephemeral=True)
+            return
+        await interaction.response.send_message("Type mo: `!setstock <amount>`\nExample: `!setstock 2000`", ephemeral=True)
+    @discord.ui.button(label="💲 Set Price", style=discord.ButtonStyle.primary)
+    async def set_price_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admin lang pwede.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"Current price: ₱{get_price():.2f} per Robux\nPara magpalit, type mo: `!setprice <price>`\nExample: `!setprice 0.75` = ₱0.75 per Robux", ephemeral=True)
+    @discord.ui.button(label="🖼️ Set Banner", style=discord.ButtonStyle.secondary)
+    async def set_banner_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admin lang pwede.", ephemeral=True)
+            return
+        await interaction.response.send_message("Para magpalit ng banner:\n1. Mag-attach ka ng pic\n2. Type mo `!setbanner` sabay nung pic\nPara alisin: `!removebanner`", ephemeral=True)
+    @discord.ui.button(label="💸 Set GCash", style=discord.ButtonStyle.success)
+    async def set_gcash_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admin lang pwede.", ephemeral=True)
+            return
+        gcash = load_gcash()
+        cur = f"Number: {gcash['number'] or 'Not set'} | QR: {'Set ✅' if gcash['qr'] else 'Not set'}"
+        await interaction.response.send_message(f"Current GCash: {cur}\n\nPara palitan:\n`!setgcash 09123456789` - Palit number\n`!setgcash 09123456789 Juan` - Palit number + name\nAttach QR pic + `!setqr` - Palit QR pic\n`!removegcash` - Alisin GCash info", ephemeral=True)
+    @discord.ui.button(label="🗑️ Reset Stock", style=discord.ButtonStyle.secondary)
+    async def reset_stock_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ Admin lang pwede.", ephemeral=True)
+            return
+        stock = load_stock()
+        stock["robux"] = 0
+        save_stock(stock)
+        await interaction.response.send_message("🗑️ Stock reset to 0.", ephemeral=True)
+
+class BuyAmountView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        for amt in [50, 100, 150, 200, 300, 500, 1000]:
+            btn = discord.ui.Button(label=f"₱{amt} = {robux_for_pesos(amt)} Robux", style=discord.ButtonStyle.primary, custom_id=f"buy_{amt}")
+            btn.callback = self.make_buy_callback(amt)
+            self.add_item(btn)
+    def make_buy_callback(self, pesos):
+        async def callback(interaction: discord.Interaction):
+            existing = has_open_ticket(interaction.guild, interaction.user)
+            if existing:
+                await interaction.response.send_message(f"May open ticket ka pa! Tapusin mo muna. Ticket mo: {existing.mention}", ephemeral=True)
+                return
+            need = robux_for_pesos(pesos)
+            stock = load_stock()
+            if stock["robux"] < need:
+                await interaction.response.send_message(f"❌ Out of stock! Only {stock['robux']} Robux left.", ephemeral=True)
+                return
+            try:
+                channel = await create_pending_ticket(interaction.guild, interaction.user, pesos, need)
+                embed = discord.Embed(title="🧾 PENDING ORDER", description="Waiting for payment.", color=0xF59E0B)
+                embed.add_field(name="Buyer", value=interaction.user.mention, inline=False)
+                embed.add_field(name="Amount to Pay", value=f"₱{pesos}", inline=True)
+                embed.add_field(name="You Will Get", value=f"{need} Robux", inline=True)
+                embed.add_field(name="Next Step", value="Pay via GCash • Send screenshot + IGN", inline=False)
+                await channel.send(f"{interaction.user.mention} Ticket mo auto-created!", embed=embed)
+                await channel.send(embed=make_payment_embed(pesos, need))
+                await channel.send("Waiting for seller to confirm payment.", view=ConfirmView())
+                await interaction.response.send_message(f"✅ Order created! Ticket: {channel.mention}\n₱{pesos} = {need} Robux", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+        return callback
+
+class CatalogueView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    @discord.ui.button(label="💰 View Robux Prices", style=discord.ButtonStyle.primary)
+    async def view_prices(self, interaction: discord.Interaction, button: discord.ui.Button):
+        stock = load_stock()
+        embed = discord.Embed(title="💜 ROBUX PRICELIST 💜", description=f"₱{get_price():.2f} per Robux", color=0xA855F7)
+        embed.add_field(name="Price List", value=pricelist_text(), inline=False)
+        embed.add_field(name="📦 Stock", value=f"{stock['robux']} Robux", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    @discord.ui.button(label="🛒 Buy Now", style=discord.ButtonStyle.success)
+    async def buy_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = discord.Embed(title="🛒 Choose Amount", description="Choose how much you want to buy:", color=0x22C55E)
+        await interaction.response.send_message(embed=embed, view=BuyAmountView(), ephemeral=True)
+    @discord.ui.button(label="🎫 Open Ticket", style=discord.ButtonStyle.secondary)
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _ex2 = has_open_ticket(interaction.guild, interaction.user)
+        if _ex2:
+            await interaction.response.send_message(f"May open ticket ka pa! Ticket mo: {_ex2.mention}", ephemeral=True)
+            return
+        guild = interaction.guild
+        user = interaction.user
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+        }
+        for role in guild.roles:
+            if role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        channel = await guild.create_text_channel(f"ticket-{user.name}", overwrites=overwrites)
+        active_tickets[user.id] = channel.id
+        await channel.send(f"🎫 Hello {user.mention}!\nSend your order here.\n**IGN:**\n**Amount:** ₱\n**GCash Screenshot:**", view=CloseTicketView())
+        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+    @discord.ui.button(label="📦 Check Stock", style=discord.ButtonStyle.secondary)
+    async def check_stock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        stock = load_stock()
+        await interaction.response.send_message(f"📦 **Current Stock:** {stock['robux']} Robux", ephemeral=True)
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.guilds = True
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    print("Bot is online!")
+
+@bot.event
+async def on_member_join(member):
+    role_id = load_autorole()
+    if not role_id:
+        return
+    role = member.guild.get_role(role_id)
+    if role:
+        try:
+            await member.add_roles(role)
+            print(f"Auto-role: gave {role.name} to {member}")
+        except Exception as e:
+            print(f"Auto-role failed: {e}")
+
+@bot.command()
+async def shop(ctx):
+    stock = load_stock()
+    await ctx.send(embed=make_catalogue_embed(stock), view=CatalogueView())
+
+@bot.command()
+async def pricelist(ctx):
+    stock = load_stock()
+    embed = discord.Embed(title="💜 ROBUX PRICELIST 💜", description=f"₱{get_price():.2f} per Robux", color=0xA855F7)
+    # Walang banner dito - banner is ONLY for !shop
+    embed.add_field(name="Price List", value=pricelist_text(), inline=False)
+    embed.add_field(name="📦 Stock", value=f"{stock['robux']} Robux", inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def stock(ctx):
+    stock = load_stock()
+    await ctx.send(f"📦 **Current Stock:** {stock['robux']} Robux")
+
+@bot.command()
+async def price(ctx):
+    price = get_price()
+    await ctx.send(f"💲 **Current Price:** ₱{price:.2f} per Robux\nExample: ₱100 = {int(100 / price)} Robux")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setprice(ctx, price: float = None):
+    if price is None:
+        await ctx.send(f"💲 Current price: ₱{get_price():.2f} per Robux\nUsage: `!setprice <price>`\nExample: `!setprice 0.75`")
+        return
+    if price <= 0 or price > 5:
+        await ctx.send("❌ Price must be between ₱0.01 and ₱5.00 per Robux. Example: `!setprice 0.75`")
+        return
+    old = get_price()
+    save_price(price)
+    amounts = [50, 100, 150, 200, 300, 500, 1000]
+    preview = "\n".join([f"₱{p} = {int(p / price)} Robux" for p in amounts])
+    embed = discord.Embed(title="💲 PRICE UPDATED!", description=f"₱{old:.2f} → ₱{price:.2f} per Robux", color=0x22C55E)
+    embed.add_field(name="New Price List", value=preview, inline=False)
+    embed.add_field(name="Note", value="New price applied to `!shop` / `!pricelist` / `!buy`.", inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setgcash(ctx, number: str = None, *, name: str = ""):
+    if number is None:
+        gcash = load_gcash()
+        await ctx.send(f"💸 Current GCash: {gcash['number'] or 'Not set'} ({gcash['name']})\nUsage: `!setgcash <number> [name]`\nExample: `!setgcash 09123456789 Juan Dela Cruz`")
+        return
+    save_gcash(number=number, name=name)
+    await ctx.send(f"✅ GCash number updated: **{number}** {f'({name})' if name else ''}\nTest mo: `!buy 100` - dapat may QR + number na sa ticket!")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setqr(ctx):
+    if not ctx.message.attachments:
+        await ctx.send("❌ Walang QR pic! Ganito:\n1. Mag-attach ka ng QR pic mo\n2. Type mo `!setqr` sa same message")
+        return
+    url = ctx.message.attachments[0].url
+    save_gcash(qr=url)
+    embed = discord.Embed(title="📷 GCash QR Updated!", description="Na-palitan na yung QR mo!", color=0x007DFF)
+    embed.set_image(url=url)
+    await ctx.send(embed=embed)
+    await ctx.send("Test mo: `!buy 100` - dapat may QR na sa ticket!")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def removegcash(ctx):
+    with open(GCASH_FILE, "w") as f:
+        json.dump({"number": None, "name": "", "qr": None}, f)
+    await ctx.send("🗑️ GCash info removed.")
+
+@bot.command()
+async def gcash(ctx):
+    gcash = load_gcash()
+    if not gcash["number"] and not gcash["qr"]:
+        await ctx.send("💸 GCash not set yet. Contact seller.")
+        return
+    embed = discord.Embed(title="💸 PAYMENT - GCash", color=0x007DFF)
+    if gcash["number"]:
+        embed.add_field(name="GCash Number", value=f"**{gcash['number']}** {f'({gcash["name"]})' if gcash['name'] else ''}", inline=False)
+    if gcash["qr"]:
+        embed.set_image(url=gcash["qr"])
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setautorole(ctx, role: discord.Role = None):
+    if role is None:
+        cur = load_autorole()
+        if cur:
+            r = ctx.guild.get_role(cur)
+            await ctx.send(f"Current auto-role: {r.mention if r else cur}\nUsage: `!setautorole @RoleName`\nExample: `!setautorole @Member`")
+        else:
+            await ctx.send("No auto-role set yet. Usage: `!setautorole @RoleName`\nExample: `!setautorole @Member`")
+        return
+    save_autorole(role.id)
+    await ctx.send(f"✅ Auto-role set! New members will automatically get: {role.mention}\nTest: invite someone or ask a friend to join, dapat may role na sila agad.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def removeautorole(ctx):
+    save_autorole(None)
+    await ctx.send("🗑️ Auto-role removed. New members will not get any role automatically.")
+
+@bot.command()
+async def autorole(ctx):
+    cur = load_autorole()
+    if cur:
+        r = ctx.guild.get_role(cur)
+        await ctx.send(f"🎭 Auto-role: {r.mention if r else cur}")
+    else:
+        await ctx.send("No auto-role set. Admin can set with `!setautorole @RoleName`")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def addrole(ctx, role: discord.Role = None, *, label: str = ""):
+    if role is None:
+        await ctx.send("Usage: `!addrole @RoleName [label]`\nExample: `!addrole @Buyer`\nExample: `!addrole @Seller Buyer Role`")
+        return
+    roles = load_rolemenu()
+    for r in roles:
+        if r["id"] == role.id:
+            await ctx.send(f"⚠️ {role.mention} nasa menu na!")
+            return
+    roles.append({"id": role.id, "name": role.name, "label": label if label else role.name, "emoji": "🎭"})
+    save_rolemenu(roles)
+    await ctx.send(f"✅ Added to role menu: {role.mention} as **{label if label else role.name}**\nType `!rolemenu` para i-send yung menu!")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def removerole(ctx, role: discord.Role = None):
+    if role is None:
+        await ctx.send("Usage: `!removerole @RoleName`")
+        return
+    roles = load_rolemenu()
+    new_roles = [r for r in roles if r["id"] != role.id]
+    if len(new_roles) == len(roles):
+        await ctx.send(f"❌ {role.mention} wala sa menu.")
+        return
+    save_rolemenu(new_roles)
+    await ctx.send(f"🗑️ Removed from role menu: {role.mention}")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def clearroles(ctx):
+    save_rolemenu([])
+    await ctx.send("🗑️ Lahat ng roles sa menu, na-clear na.")
+
+@bot.command()
+async def listroles(ctx):
+    roles = load_rolemenu()
+    if not roles:
+        await ctx.send("Walang roles sa menu. Admin: `!addrole @RoleName` para magdagdag.")
+        return
+    lines = []
+    for r in roles:
+        role = ctx.guild.get_role(r["id"])
+        lines.append(f"• {role.mention if role else r['name']} - {r.get('label','')}")
+    await ctx.send("**🎭 Role Menu List:**\n" + "\n".join(lines))
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def rolemenu(ctx):
+    roles = load_rolemenu()
+    if not roles:
+        await ctx.send("❌ Walang roles sa menu. Magdagdag ka muna: `!addrole @RoleName`")
+        return
+    embed = discord.Embed(title="🎭 CHOOSE YOUR ROLE", description="Pindutin mo lang yung button kung anong role gusto mo!\nPindutin ulit para alisin.\n\n**Airport - Pick your role:**", color=0xA855F7)
+    lines = []
+    for r in roles:
+        role = ctx.guild.get_role(r["id"])
+        if role:
+            lines.append(f"🎭 **{r.get('label', role.name)}** - {role.mention}")
+    embed.add_field(name="Available Roles", value="\n".join(lines) if lines else "No roles", inline=False)
+    embed.set_footer(text="Click to get / remove role")
+    await ctx.send(embed=embed, view=RoleMenuView())
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setbanner(ctx):
+    if not ctx.message.attachments:
+        await ctx.send("❌ Walang pic! Ganito:\n1. Mag-attach ka ng pic\n2. Type mo `!setbanner` sa same message")
+        return
+    url = ctx.message.attachments[0].url
+    save_banner(url)
+    embed = discord.Embed(title="🖼️ Banner Updated!", description="Na-palitan na yung banner!", color=0xA855F7)
+    embed.set_image(url=url)
+    await ctx.send(embed=embed)
+    await ctx.send("Test mo: `!shop` - dapat may pic na sa taas!")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def removebanner(ctx):
+    with open(BANNER_FILE, "w") as f:
+        json.dump({"url": None}, f)
+    await ctx.send("🗑️ Banner removed.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def admin(ctx):
+    stock = load_stock()
+    banner = load_banner()
+    embed = discord.Embed(title="⚙️ ADMIN SETTINGS", description="Ikaw lang makakakita nito. Admin only.", color=0xFF6B00)
+    embed.add_field(name="💲 Current Price", value=f"₱{get_price():.2f} per Robux", inline=False)
+    embed.add_field(name="📦 Current Stock", value=f"{stock['robux']} Robux", inline=False)
+    gcash = load_gcash()
+    embed.add_field(name="💸 GCash", value=f"{gcash['number'] or 'Not set'} | QR: {'Set ✅' if gcash['qr'] else 'Not set'}", inline=False)
+    embed.add_field(name="🖼️ Banner", value="May banner na ✅" if banner else "Walang banner - type `!setbanner` + attach pic", inline=False)
+    embed.add_field(name="Commands", value="`!addstock` - Dagdag\n`!removestock` - Bawas\n`!setstock` - Palitan exact\n`!setprice 0.75` - Palit price\n`!setgcash 09123456789` - Palit GCash number\n`!setqr` + attach QR - Palit QR\n`!setautorole @Member` - Auto-role\n`!addrole @Buyer` - Dagdag role sa airport menu\n`!rolemenu` - Send airport menu\n`!setbanner` + attach pic - Palit banner\n`!removebanner` - Alisin banner\n`!confirm` - Confirm order", inline=False)
+    await ctx.send(embed=embed, view=AdminSettingsView())
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def addstock(ctx, amount: int):
+    stock = load_stock()
+    stock["robux"] += amount
+    save_stock(stock)
+    await ctx.send(f"✅ Added {amount} Robux. New stock: {stock['robux']} Robux")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def removestock(ctx, amount: int):
+    stock = load_stock()
+    if amount > stock["robux"]:
+        await ctx.send(f"❌ Hindi pwede. Stock mo lang ay {stock['robux']} Robux.")
+        return
+    stock["robux"] -= amount
+    save_stock(stock)
+    await ctx.send(f"➖ Removed {amount} Robux. New stock: {stock['robux']} Robux")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setstock(ctx, amount: int):
+    stock = load_stock()
+    old = stock["robux"]
+    stock["robux"] = amount
+    save_stock(stock)
+    await ctx.send(f"✏️ Stock changed: {old} -> {amount} Robux")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def confirm(ctx):
+    order = pending_orders.get(ctx.channel.id)
+    if not order:
+        await ctx.send("❌ Walang pending order dito.")
+        return
+    stock = load_stock()
+    if stock["robux"] < order["need"]:
+        await ctx.send(f"❌ Kulang stock!")
+        return
+    stock["robux"] -= order["need"]
+    save_stock(stock)
+    del pending_orders[ctx.channel.id]
+    await ctx.send(f"✅ Confirmed! ₱{order['pesos']} = {order['need']} Robux. Remaining: {stock['robux']} Robux")
+
+@bot.command()
+async def buy(ctx, pesos: int = None):
+    if ctx.guild:
+        _ex = has_open_ticket(ctx.guild, ctx.author)
+        if _ex:
+            await ctx.send(f"May open ticket ka pa! Tapusin mo muna. Ticket mo: {_ex.mention}")
+            return
+    if pesos is None:
+        await ctx.send("Usage: `!buy <pesos>` or use `!shop`")
+        return
+    if pesos < 50:
+        await ctx.send("❌ Minimum order is ₱50")
+        return
+    need = robux_for_pesos(pesos)
+    stock = load_stock()
+    if stock["robux"] < need:
+        await ctx.send(f"❌ Out of stock! Only {stock['robux']} Robux left.")
+        return
+    channel = await create_pending_ticket(ctx.guild, ctx.author, pesos, need)
+    embed = discord.Embed(title="🧾 PENDING ORDER", description="Waiting for payment.", color=0xF59E0B)
+    embed.add_field(name="Amount", value=f"₱{pesos}", inline=True)
+    embed.add_field(name="You Get", value=f"{need} Robux", inline=True)
+    await channel.send(embed=embed)
+    await channel.send(embed=make_payment_embed(pesos, need))
+    await channel.send("Waiting for seller to confirm payment.", view=ConfirmView())
+    await ctx.send(f"✅ Order created: {channel.mention}")
+
+@bot.command()
+async def ticket(ctx):
+    guild = ctx.guild
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        ctx.author: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+    }
+    channel = await guild.create_text_channel(f"ticket-{ctx.author.name}", overwrites=overwrites)
+    active_tickets[ctx.author.id] = channel.id
+    await channel.send(f"🎫 Hello {ctx.author.mention}! Send your order here.", view=CloseTicketView())
+    await ctx.send(f"✅ Ticket created: {channel.mention}")
+
+@bot.command()
+async def close(ctx):
+    if ctx.channel.name.startswith("ticket-"):
+        _ord2 = pending_orders.pop(ctx.channel.id, None)
+        _uid2 = _ord2.get('buyer_id') if _ord2 else None
+        if _uid2:
+            active_tickets.pop(_uid2, None)
+        await ctx.send("Closing ticket in 3 seconds...")
+        import asyncio
+        await asyncio.sleep(3)
+        await ctx.channel.delete()
+    else:
+        await ctx.send("This is not a ticket channel.")
+
+bot.run(TOKEN)
